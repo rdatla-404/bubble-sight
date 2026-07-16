@@ -4,10 +4,10 @@
 # =============================================================
 # This script lets you enter any stock ticker, downloads its
 # price history from Yahoo Finance, computes key risk metrics,
-# and tells you whether the stock shows sign of a bubble.
+# and tells you whether the stock shows signs of a bubble.
 #
 # Bubble scoring is now driven by an Isolation Forest anomaly
-# detection model (see train_bubble_model.py) instead of hand
+# detection model (see train_bubble_model.py) instead of hand-
 # tuned point thresholds. The model is trained offline across a
 # broad universe of tickers and loaded here for inference.
 #
@@ -16,6 +16,10 @@
 # =============================================================
 
 import os
+import time
+import logging
+from typing import Optional
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -27,6 +31,9 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bubble_model.pkl')
 
 # Feature order must match train_bubble_model.py exactly.
@@ -37,47 +44,74 @@ FEATURE_NAMES = ['rsi', 'ma_ratio', 'volatility', 'accel', 'max_drawdown']
 # SECTION 1: DATA LOADING
 # -------------------------------------------------------------
 
-def load_stock_data(ticker, start_date, end_date):
+def load_stock_data(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    max_retries: int = 3,
+    retry_backoff_seconds: float = 2.0,
+) -> Optional[pd.DataFrame]:
     """
     Download historical daily price data from Yahoo Finance.
 
+    Retries with exponential backoff on transient failures (Yahoo
+    Finance rate-limits or hiccups often enough that a bare single
+    attempt silently drops tickers, which matters most during
+    training when we're hitting it 60+ times in a row).
+
     Parameters:
-        ticker     : str -- Stock symbol, e.g. 'AAPL'
-        start_date : str -- Start date in 'YYYY-MM-DD' format
-        end_date   : str -- End date in 'YYYY-MM-DD' format
+        ticker                 : str   -- Stock symbol, e.g. 'AAPL'
+        start_date              : str   -- Start date in 'YYYY-MM-DD' format
+        end_date                : str   -- End date in 'YYYY-MM-DD' format
+        max_retries              : int   -- Attempts before giving up (default 3)
+        retry_backoff_seconds    : float -- Base delay between retries, doubles
+                                             each attempt (default 2.0s)
 
     Returns:
         pandas DataFrame with columns [Open, High, Low, Close, Volume],
         or None if the download failed or the ticker was invalid.
     """
     ticker = ticker.upper().strip()
-    print(f"\n  Downloading data for {ticker} ...")
+    logger.info(f"Downloading data for {ticker} ...")
 
-    try:
-        ticker_obj = yf.Ticker(ticker)
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            ticker_obj = yf.Ticker(ticker)
+            data = ticker_obj.history(start=start_date, end=end_date)
 
-        # .history() fetches OHLCV data for the given date range
-        data = ticker_obj.history(start=start_date, end=end_date)
+            if data.empty:
+                logger.warning(
+                    f"No data returned for '{ticker}'. "
+                    "Check that the ticker symbol is correct."
+                )
+                return None
 
-        if data.empty:
-            print(f"  WARNING: No data returned for '{ticker}'.")
-            print("  Check that the ticker symbol is correct and try again.")
-            return None
+            logger.info(
+                f"OK -- {ticker}: {len(data)} trading days loaded "
+                f"({start_date} to {end_date})"
+            )
+            return data
 
-        print(f"  OK -- {ticker}: {len(data)} trading days loaded "
-              f"({start_date} to {end_date})")
-        return data
+        except Exception as error:
+            last_error = error
+            if attempt < max_retries:
+                delay = retry_backoff_seconds * (2 ** (attempt - 1))
+                logger.warning(
+                    f"Attempt {attempt}/{max_retries} failed for {ticker} "
+                    f"({error}). Retrying in {delay:.1f}s..."
+                )
+                time.sleep(delay)
 
-    except Exception as error:
-        print(f"  ERROR downloading {ticker}: {error}")
-        return None
+    logger.error(f"Giving up on {ticker} after {max_retries} attempts: {last_error}")
+    return None
 
 
 # -------------------------------------------------------------
 # SECTION 2: METRIC CALCULATIONS
 # -------------------------------------------------------------
 
-def get_current_price(data):
+def get_current_price(data: pd.DataFrame) -> float:
     """
     Return the most recent closing price.
 
@@ -90,7 +124,7 @@ def get_current_price(data):
     return round(float(data['Close'].iloc[-1]), 2)
 
 
-def get_total_return(data):
+def get_total_return(data: pd.DataFrame) -> float:
     """
     Calculate the percentage gain/loss from first to last price.
 
@@ -109,7 +143,7 @@ def get_total_return(data):
     return round(((end_price - start_price) / start_price) * 100, 2)
 
 
-def get_daily_returns(data):
+def get_daily_returns(data: pd.DataFrame) -> pd.Series:
     """
     Calculate the percentage price change for each trading day.
 
@@ -121,7 +155,7 @@ def get_daily_returns(data):
     return data['Close'].pct_change().dropna()
 
 
-def get_volatility(data):
+def get_volatility(data: pd.DataFrame) -> float:
     """
     Calculate annualized volatility -- a standard measure of price risk.
 
@@ -145,7 +179,7 @@ def get_volatility(data):
     return round(float(annual_std * 100), 2)
 
 
-def get_moving_average(data, window):
+def get_moving_average(data: pd.DataFrame, window: int) -> pd.Series:
     """
     Calculate a simple moving average over a rolling window of days.
 
@@ -163,7 +197,7 @@ def get_moving_average(data, window):
     return data['Close'].rolling(window=window).mean()
 
 
-def get_rsi(data, period=14):
+def get_rsi(data: pd.DataFrame, period: int = 14) -> pd.Series:
     """
     Calculate the Relative Strength Index (RSI).
 
@@ -201,7 +235,7 @@ def get_rsi(data, period=14):
     return rsi
 
 
-def get_price_to_200ma_ratio(data):
+def get_price_to_200ma_ratio(data: pd.DataFrame) -> Optional[pd.Series]:
     """
     Calculate how far the current price is above the 200-day moving average.
 
@@ -217,14 +251,14 @@ def get_price_to_200ma_ratio(data):
         pandas Series of ratio values, or None if not enough data.
     """
     if len(data) < 200:
-        print("  NOTE: Less than 200 days of data -- MA ratio unavailable.")
+        logger.info("Less than 200 days of data -- MA ratio unavailable.")
         return None
 
     ma_200 = get_moving_average(data, 200)
     return data['Close'] / ma_200
 
 
-def get_max_drawdown(data):
+def get_max_drawdown(data: pd.DataFrame) -> float:
     """
     Calculate the maximum drawdown -- the largest peak-to-trough decline.
 
@@ -273,6 +307,22 @@ def get_model_info():
     }
 
 
+def reload_model() -> Optional[dict]:
+    """
+    Force a fresh read of bubble_model.pkl from disk, discarding any
+    cached bundle. Call this after retraining so the new model takes
+    effect without restarting the process (e.g. after the app's
+    "Train / retrain model" button finishes).
+
+    Returns:
+        The freshly loaded model bundle dict, or None if the file
+        doesn't exist.
+    """
+    global _MODEL_BUNDLE
+    _MODEL_BUNDLE = None
+    return _load_model_bundle()
+
+
 def _load_model_bundle():
     """
     Load the trained model bundle from disk (cached after first call).
@@ -292,7 +342,7 @@ def _load_model_bundle():
     return _MODEL_BUNDLE
 
 
-def compute_feature_vector(data):
+def compute_feature_vector(data: pd.DataFrame) -> Optional[dict]:
     """
     Build the continuous feature snapshot fed to the ML model.
 
@@ -350,7 +400,7 @@ def compute_feature_vector(data):
     }
 
 
-def assign_risk_level(bubble_score):
+def assign_risk_level(bubble_score: float) -> str:
     """
     Convert a numeric bubble score (0-100) to a text risk label.
 
@@ -372,7 +422,7 @@ def assign_risk_level(bubble_score):
         return "HEALTHY -- No Bubble Detected"
 
 
-def run_bubble_analysis(ticker, data):
+def run_bubble_analysis(ticker: str, data: pd.DataFrame) -> dict:
     """
     Score bubble risk using the trained Isolation Forest model.
 
@@ -395,11 +445,11 @@ def run_bubble_analysis(ticker, data):
         dict with keys: ticker, bubble_score, risk_level,
                         warnings, sub_scores (z-scores per feature)
     """
-    print(f"\n  Running ML bubble analysis on {ticker} ...")
+    logger.info(f"Running ML bubble analysis on {ticker} ...")
 
     bundle = _load_model_bundle()
     if bundle is None:
-        print("  WARNING: bubble_model.pkl not found. Run train_bubble_model.py first.")
+        logger.warning("bubble_model.pkl not found. Run train_bubble_model.py first.")
         return {
             'ticker': ticker,
             'bubble_score': None,
@@ -410,7 +460,7 @@ def run_bubble_analysis(ticker, data):
 
     features = compute_feature_vector(data)
     if features is None:
-        print("  NOTE: Not enough history to compute the full feature set.")
+        logger.info("Not enough history to compute the full feature set.")
         return {
             'ticker': ticker,
             'bubble_score': None,
@@ -765,7 +815,7 @@ def plot_stock_detail(ticker, data, show=True, save=True):
                        Red shading marks where price is >30% above 200-day MA.
         Bottom panel : RSI with overbought (70) and oversold (30) zones.
 
-    By default, this saves a .png and displays it (CLI usage). Pass
+    By default this saves a .png and displays it (CLI usage). Pass
     show=False, save=False to just get the Figure object back for
     embedding elsewhere (e.g. the Streamlit app calls it this way).
 
