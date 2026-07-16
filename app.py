@@ -14,6 +14,7 @@
 # =============================================================
 
 from datetime import datetime, timedelta
+import os
 
 import streamlit as st
 import pandas as pd
@@ -46,6 +47,37 @@ FEATURE_LABELS = {
 }
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_load_stock_data(ticker: str, start_date: str, end_date: str):
+    """
+    Cached wrapper around sbd.load_stock_data(). Streamlit reruns the
+    whole script on every widget interaction (not just button clicks),
+    so without caching, clicking anything else in the sidebar while a
+    ticker is loaded would silently re-hit Yahoo Finance. Cache expires
+    after an hour so intraday price moves aren't stale forever.
+    """
+    return sbd.load_stock_data(ticker, start_date, end_date)
+
+
+@st.cache_data(show_spinner=False)
+def load_ticker_directory():
+    """
+    Load the static NASDAQ/NYSE/AMEX ticker directory (all_tickers.csv)
+    for the company-name search helper below. This is a reference file
+    only -- it has no bearing on the model's training universe
+    (train_bubble_model.py's TICKER_UNIVERSE is intentionally curated,
+    not "all tickers" -- see the discussion on why). It's just here so
+    you can look up a symbol if you know the company but not the ticker.
+
+    Returns an empty DataFrame if the file isn't present, so the app
+    still runs without it.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "all_tickers.csv")
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=["symbol", "name", "exchange", "sector", "industry", "market_cap"])
+    return pd.read_csv(path)
+
+
 # -------------------------------------------------------------
 # Sidebar: model status + retrain control
 # -------------------------------------------------------------
@@ -73,7 +105,7 @@ with st.sidebar:
             rows = trainer.build_training_rows()
             progress_box.info(f"Collected {len(rows)} snapshots. Fitting model...")
             trainer.train_and_save(rows)
-        sbd._MODEL_BUNDLE = None  # force reload of the new model
+        sbd.reload_model()  # force reload of the new model
         progress_box.success("Model trained and saved.")
         st.rerun()
 
@@ -91,6 +123,21 @@ with st.sidebar:
 # -------------------------------------------------------------
 st.title("Stock Bubble Detector")
 st.caption("ML-based bubble risk scoring, powered by Yahoo Finance data.")
+
+with st.expander("Don't know the ticker? Search by company name"):
+    ticker_dir = load_ticker_directory()
+    if ticker_dir.empty:
+        st.caption("Ticker directory (all_tickers.csv) not found next to this app.")
+    else:
+        search_text = st.text_input("Company name contains...", value="", key="company_search")
+        if search_text:
+            matches = ticker_dir[ticker_dir["name"].str.contains(search_text, case=False, na=False)]
+            st.caption(f"{len(matches)} match(es) -- copy a symbol into the field below")
+            st.dataframe(
+                matches[["symbol", "name", "exchange", "sector"]].head(50),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 col_a, col_b, col_c = st.columns([2, 1, 1])
 with col_a:
@@ -114,7 +161,7 @@ if analyze_clicked and ticker_input:
     start_date = (datetime.today() - timedelta(days=365 * years)).strftime("%Y-%m-%d")
 
     with st.spinner(f"Downloading {ticker_input} data..."):
-        data = sbd.load_stock_data(ticker_input, start_date, end_date)
+        data = cached_load_stock_data(ticker_input, start_date, end_date)
 
     if data is None or data.empty:
         st.error(
