@@ -1,11 +1,4 @@
 # =============================================================
-# stock_analyzer.py
-# Stock Bubble Detector (ML edition)
-# =============================================================
-# This script lets you enter any stock ticker, downloads its
-# price history from Yahoo Finance, computes key risk metrics,
-# and tells you whether the stock shows signs of a bubble.
-#
 # Bubble scoring is now driven by an Isolation Forest anomaly
 # detection model (see train_bubble_model.py) instead of hand-
 # tuned point thresholds. The model is trained offline across a
