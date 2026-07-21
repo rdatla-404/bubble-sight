@@ -1,9 +1,4 @@
 # =============================================================
-# tests/test_bubble_detector.py
-# Unit tests for the metric-calculation functions in
-# stock_bubble_detector.py. Run with:
-#   pytest
-#
 # These use small synthetic price series with known, hand-computable
 # results rather than real market data -- the point is to catch a
 # silent math bug in the formulas (e.g. a sign flip, an off-by-one
